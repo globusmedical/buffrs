@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use buffrs::command::{self, GenerationFlags, InstallMode};
+use std::env;
+
+use buffrs::command::{self, GenerationOption, InstallMode};
 use buffrs::config::Config;
 use buffrs::manifest::Manifest;
-use buffrs::package::PackageName;
+use buffrs::package::{PackageName, PackageStore};
+use buffrs::registry::CertValidationPolicy;
 use buffrs::{manifest::MANIFEST_FILE, package::PackageType};
-use clap::CommandFactory;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use miette::{miette, IntoDiagnostic, WrapErr};
 use semver::Version;
 
@@ -29,6 +31,13 @@ struct Cli {
     /// Opt out of applying default arguments from config
     #[clap(long)]
     ignore_defaults: bool,
+
+    /// Disable certificate validation
+    ///
+    /// By default, every secure connection buffrs makes will validate the certificate chain.
+    /// This option makes buffrs skip the verification step and proceed without checking.
+    #[clap(long, long = "insecure", short = 'k')]
+    disable_cert_validation: bool,
 
     #[command(subcommand)]
     command: Command,
@@ -99,6 +108,10 @@ enum Command {
         /// Note: This overrides the version in the manifest.
         #[clap(long)]
         set_version: Option<Version>,
+        /// Indicate whether access time information is preserved when creating a package.
+        /// Default is 'true'
+        #[clap(long)]
+        preserve_mtime: Option<bool>,
     },
 
     /// Packages and uploads this api to the registry
@@ -120,17 +133,26 @@ enum Command {
         /// Note: This overrides the version in the manifest.
         #[clap(long)]
         set_version: Option<Version>,
+        /// Indicate whether access time information is preserved when creating a package.
+        /// Default is 'true'
+        #[clap(long)]
+        preserve_mtime: Option<bool>,
     },
 
     /// Installs dependencies
     Install {
+        /// Indicate whether access time information is preserved when installing a local.
+        /// Default is 'true'
+        #[clap(long)]
+        preserve_local_mtime: Option<bool>,
+
         /// Only install dependencies
         #[clap(long, default_value = "false")]
         only_dependencies: bool,
 
         /// Generate buf.yaml file matching the installed dependencies
         #[clap(long, default_value = "false")]
-        buf_yaml: bool,
+        generate_buf_yaml: bool,
     },
 
     /// Uninstalls dependencies
@@ -145,6 +167,10 @@ enum Command {
         /// Artifactory url (e.g. https://<domain>/artifactory)
         #[clap(long)]
         registry: Option<String>,
+
+        /// Token to use for login (if not provided, will prompt for input)
+        #[clap(long)]
+        token: Option<String>,
     },
     /// Logs you out from a registry
     Logout {
@@ -182,18 +208,26 @@ async fn main() -> miette::Result<()> {
         .try_init()
         .unwrap();
 
-    let cwd = std::env::current_dir().into_diagnostic()?;
+    // The CLI handling is part of the library crate.
+    // This allows build.rs scripts to simply declare buffrs as
+    // a dependency and use the CLI without any additional setup.
+    let args = env::args().collect::<Vec<_>>();
+    run(&args).await
+}
 
-    let config = Config::new(Some(&cwd))?;
+/// Main entry point for the CLI
+async fn run(args: &[String]) -> miette::Result<()> {
+    let cwd = std::env::current_dir().into_diagnostic()?;
+    let config = Config::new_from_workspace(&cwd)?;
 
     // Merge default arguments with user-specified arguments
-    let args = merge_with_default_args(&config);
+    let merged_args = merge_args_with_defaults(&config, args);
 
     // Parse CLI with merged arguments
-    let cli = Cli::parse_from(args);
+    let cli = Cli::parse_from(merged_args);
 
     let manifest = if Manifest::exists().await? {
-        Some(Manifest::read().await?)
+        Some(Manifest::read(&config).await?)
     } else {
         None
     };
@@ -208,6 +242,12 @@ async fn main() -> miette::Result<()> {
         manifest
             .and_then(|m| m.package.map(|p| p.name.to_string()))
             .unwrap_or_else(|| name.to_string())
+    };
+
+    let policy = if cli.disable_cert_validation {
+        CertValidationPolicy::NoValidation
+    } else {
+        CertValidationPolicy::Validate
     };
 
     match cli.command {
@@ -228,15 +268,15 @@ async fn main() -> miette::Result<()> {
                 .await
                 .wrap_err(miette!("failed to initialize {}", format!("`{package}`")))
         }
-        Command::Login { registry } => {
-            let registry = config.resolve_registry_string(&registry)?;
-            command::login(&registry, None)
+        Command::Login { registry, token } => {
+            let registry = config.parse_registry_arg(&registry)?;
+            command::login(&registry, token, policy, &config)
                 .await
                 .wrap_err(miette!("failed to login to `{registry}`"))
         }
         Command::Logout { registry } => {
-            let registry = config.resolve_registry_string(&registry)?;
-            command::logout(&registry)
+            let registry = config.parse_registry_arg(&registry)?;
+            command::logout(&registry, &config)
                 .await
                 .wrap_err(miette!("failed to logout from `{registry}`"))
         }
@@ -245,55 +285,73 @@ async fn main() -> miette::Result<()> {
             dependency,
         } => {
             let registry = config.parse_registry_arg(&registry)?;
-            let resolved_registry = config.resolve_registry_uri(&registry)?;
-            command::add(&registry, &resolved_registry, &dependency)
+            command::add(&registry, &dependency, &config, policy)
                 .await
                 .wrap_err(miette!(
                     "failed to add `{dependency}` from `{registry}` to `{MANIFEST_FILE}`"
                 ))
         }
-        Command::Remove { package } => command::remove(package.to_owned()).await.wrap_err(miette!(
-            "failed to remove `{package}` from `{MANIFEST_FILE}`"
-        )),
+        Command::Remove { package } => {
+            command::remove(package.to_owned(), &config)
+                .await
+                .wrap_err(miette!(
+                    "failed to remove `{package}` from `{MANIFEST_FILE}`"
+                ))
+        }
         Command::Package {
             output_directory,
             dry_run,
             set_version,
-        } => command::package(output_directory, dry_run, set_version)
-            .await
-            .wrap_err(miette!(
-                "failed to export `{package}` into the buffrs package format"
-            )),
+            preserve_mtime,
+        } => command::package(
+            output_directory,
+            dry_run,
+            set_version,
+            preserve_mtime.unwrap_or(true),
+            &config,
+        )
+        .await
+        .wrap_err(miette!(
+            "failed to export `{package}` into the buffrs package format"
+        )),
         Command::Publish {
             registry,
             repository,
             allow_dirty,
             dry_run,
             set_version,
+            preserve_mtime,
         } => {
-            let registry = config.resolve_registry_string(&registry)?;
+            let registry = config.parse_registry_arg(&registry)?;
             command::publish(
                 &registry,
                 repository.to_owned(),
+                #[cfg(feature = "git")]
                 allow_dirty,
                 dry_run,
                 set_version,
+                preserve_mtime.unwrap_or(true),
+                &config,
+                policy,
             )
             .await
             .wrap_err(miette!(
                 "failed to publish `{package}` to `{registry}:{repository}`",
             ))
         }
-        Command::Lint => command::lint()
-            .await
-            .wrap_err(miette!("failed to lint protocol buffers",)),
+        Command::Lint => command::lint(&config).await.wrap_err(miette!(
+            "failed to lint protocol buffers in `{}`",
+            PackageStore::PROTO_PATH
+        )),
         Command::Install {
+            preserve_local_mtime,
             only_dependencies,
-            buf_yaml,
+            generate_buf_yaml,
         } => {
-            let mut generation_flags = GenerationFlags::empty();
-            if buf_yaml {
-                generation_flags |= GenerationFlags::BUF_YAML;
+            let mut generation_options = Vec::new();
+
+            if generate_buf_yaml {
+                generation_options.push(GenerationOption::BufYaml);
             }
 
             let install_mode = if only_dependencies {
@@ -302,14 +360,20 @@ async fn main() -> miette::Result<()> {
                 InstallMode::All
             };
 
-            command::install(install_mode, generation_flags, &config)
-                .await
-                .wrap_err(miette!("failed to install dependencies for `{package}`"))
+            command::install(
+                preserve_local_mtime.unwrap_or(true),
+                install_mode,
+                &generation_options,
+                &config,
+                policy,
+            )
+            .await
+            .wrap_err(miette!("failed to install dependencies for `{package}`"))
         }
         Command::Uninstall => command::uninstall()
             .await
             .wrap_err(miette!("failed to uninstall dependencies for `{package}`")),
-        Command::List => command::list().await.wrap_err(miette!(
+        Command::List => command::list(&config).await.wrap_err(miette!(
             "failed to list installed protobuf files for `{package}`"
         )),
         Command::Lock { command } => match command {
@@ -334,48 +398,46 @@ fn infer_package_type(lib: bool, api: bool) -> Option<PackageType> {
 ///
 /// # Arguments
 /// * `config` - The configuration object
+/// * `args` - The user-provided arguments
 ///
 /// # Returns
 /// A vector of arguments with default arguments merged in
-fn merge_with_default_args(config: &Config) -> Vec<String> {
-    let mut args: Vec<String> = std::env::args().collect();
-
+pub fn merge_args_with_defaults(config: &Config, args: &[String]) -> Vec<String> {
     // Check if --ignore-defaults is in the arguments
-    let initial_cli = Cli::try_parse_from(&args);
+    let initial_cli = Cli::try_parse_from(args);
     if let Ok(cli) = initial_cli {
         if cli.ignore_defaults {
-            return args; // Return original arguments if --ignore-defaults is set
+            return args.to_vec(); // Return original arguments if --ignore-defaults is set
         }
     }
 
-    // Determine the command name based on the user's input
-    let cli_matches = Cli::command().get_matches_from(args.clone());
+    // Parse the CLI matches to find the subcommand
+    let cli_matches = Cli::command().get_matches_from(args);
+    let mut args = args.to_vec();
 
-    // Find the position of the subcommand in the arguments
-    if let Some((subcommand, _)) = cli_matches.subcommand() {
-        let command_position = args
-            .iter()
-            .position(|arg| arg == subcommand)
-            .unwrap_or_else(|| args.len() - 1);
+    // Fetch sub-command-specific defaults if a subcommand is present
+    if let Some(subcommand) = cli_matches.subcommand_name() {
+        let command_specific_args = config.get_default_args(Some(subcommand));
 
-        // Get default args for this command
-        let default_args = config.get_default_args(subcommand);
-
-        if !default_args.is_empty() {
-            // Filter out any default arguments already provided by the user
+        // Find the position of the subcommand in the arguments
+        if let Some(position) = args.iter().position(|arg| arg == subcommand) {
+            // Insert command-specific defaults after the subcommand
             let user_args: std::collections::HashSet<_> = args.iter().collect();
-            let filtered_defaults: Vec<String> = default_args
+            let filtered_defaults: Vec<String> = command_specific_args
                 .into_iter()
                 .filter(|arg| !user_args.contains(arg))
                 .collect();
-
-            // Insert non-duplicate default arguments right after the command position
-            args.splice(
-                command_position + 1..command_position + 1,
-                filtered_defaults,
-            );
+            args.splice(position + 1..position + 1, filtered_defaults);
         }
     }
+
+    // Always fetch common defaults
+    let mut default_args = config.get_default_args(None);
+
+    // Prepend common defaults before all other arguments, filtering duplicates
+    let user_args: std::collections::HashSet<_> = args.iter().collect();
+    default_args.retain(|arg| !user_args.contains(arg));
+    args.splice(1..1, default_args);
 
     args
 }

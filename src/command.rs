@@ -13,19 +13,19 @@
 // limitations under the License.
 
 use crate::{
-    buf_yaml::BufYamlFile,
     cache::Cache,
     config::Config,
     credentials::Credentials,
+    integration::{buf_yaml, path_util::PathUtil},
     lock::{LockedPackage, Lockfile},
-    manifest::{Dependency, DependencyManifest, Manifest, PackageManifest, MANIFEST_FILE},
-    package::{PackageName, PackageStore, PackageType},
-    registry::{Artifactory, RegistryUri},
-    resolver::{DependencyGraph, ResolvedDependency},
+    manifest::{Dependency, Manifest, PackageManifest, MANIFEST_FILE},
+    package::{Package, PackageName, PackageStore, PackageType},
+    registry::{Artifactory, CertValidationPolicy, RegistryRef, RegistryUri},
+    resolver::{DependencyGraph, DependencyGraphBuilder, ResolvedDependency},
 };
 
 use async_recursion::async_recursion;
-use miette::{bail, ensure, miette, Context, IntoDiagnostic};
+use miette::{bail, ensure, miette, Context as _, IntoDiagnostic};
 use semver::{Version, VersionReq};
 use std::{
     env,
@@ -36,7 +36,6 @@ use tokio::{
     fs,
     io::{self, AsyncBufReadExt, BufReader},
 };
-use walkdir::WalkDir;
 
 const INITIAL_VERSION: Version = Version::new(0, 1, 0);
 const BUFFRS_TESTSUITE_VAR: &str = "BUFFRS_TESTSUITE";
@@ -176,12 +175,18 @@ impl FromStr for DependencyLocator {
 }
 
 /// Adds a dependency to this project
+///
+/// # Arguments
+/// * `registry` - The registry URI
+/// * `dependency` - The dependency to add (e.g. `my-repo/my-package@1.0`)
 pub async fn add(
-    registry: &RegistryUri,
-    resolved_registry: &RegistryUri,
+    registry: &RegistryRef,
     dependency: &str,
+    config: &Config,
+    policy: CertValidationPolicy,
 ) -> miette::Result<()> {
-    let mut manifest = Manifest::read().await?;
+    let mut manifest = Manifest::read(config).await?;
+    let registry = registry.with_alias_resolved(Some(config))?;
 
     let DependencyLocator {
         repository,
@@ -194,7 +199,7 @@ pub async fn add(
         DependencyLocatorVersion::Latest => {
             // query artifactory to retrieve the actual latest version
             let credentials = Credentials::load().await?;
-            let artifactory = Artifactory::new(resolved_registry, &credentials)?;
+            let artifactory = Artifactory::new(registry.clone().try_into()?, &credentials, policy)?;
 
             let latest_version = artifactory
                 .get_latest_version(repository.clone(), package.clone())
@@ -208,7 +213,7 @@ pub async fn add(
 
     manifest
         .dependencies
-        .push(Dependency::new(registry, repository, package, version));
+        .push(Dependency::new(&registry, repository, package, version));
 
     manifest
         .write()
@@ -217,8 +222,8 @@ pub async fn add(
 }
 
 /// Removes a dependency from this project
-pub async fn remove(package: PackageName) -> miette::Result<()> {
-    let mut manifest = Manifest::read().await?;
+pub async fn remove(package: PackageName, config: &Config) -> miette::Result<()> {
+    let mut manifest = Manifest::read(config).await?;
     let store = PackageStore::current().await?;
 
     let dependency = manifest
@@ -234,19 +239,22 @@ pub async fn remove(package: PackageName) -> miette::Result<()> {
     manifest.write().await
 }
 
-/// Packages the api and writes it to the filesystem
-pub async fn package(
-    directory: impl AsRef<Path>,
-    dry_run: bool,
-    version: Option<Version>,
-) -> miette::Result<()> {
-    let mut manifest = Manifest::read().await?;
+/// Prepare package for local packaging or remote publishing
+///
+/// # Arguments
+/// * `set_version` - Desired manifest version
+/// * `config` - Configuration data used for registry alias resolution
+async fn prepare_package(
+    set_version: Option<Version>,
+    preserve_mtime: bool,
+    config: &Config,
+) -> miette::Result<Package> {
+    let mut manifest = Manifest::read(config).await?;
     let store = PackageStore::current().await?;
 
-    if let Some(version) = version {
+    if let Some(version) = set_version {
         if let Some(ref mut package) = manifest.package {
-            tracing::info!(":: modified version in published manifest to {version}");
-
+            tracing::info!(":: modified version in manifest to {version}");
             package.version = version;
         }
     }
@@ -255,7 +263,26 @@ pub async fn package(
         store.populate(pkg).await?;
     }
 
-    let package = store.release(&manifest).await?;
+    let package = store
+        .release(&manifest, preserve_mtime, config, None)
+        .await?;
+
+    // Ensure package was fully resolved
+    package.manifest.assert_fully_resolved()?;
+
+    Ok(package)
+}
+
+/// Packages the api and writes it to the filesystem
+pub async fn package(
+    directory: impl AsRef<Path>,
+    dry_run: bool,
+    version: Option<Version>,
+    preserve_mtime: bool,
+    config: &Config,
+) -> miette::Result<()> {
+    // Prepare the package
+    let package = prepare_package(version, preserve_mtime, config).await?;
 
     if dry_run {
         return Ok(());
@@ -276,13 +303,19 @@ pub async fn package(
 }
 
 /// Publishes the api package to the registry
+#[allow(clippy::too_many_arguments)]
 pub async fn publish(
-    registry: &RegistryUri,
+    registry: &RegistryRef,
     repository: String,
     #[cfg(feature = "git")] allow_dirty: bool,
     dry_run: bool,
     version: Option<Version>,
+    preserve_mtime: bool,
+    config: &Config,
+    policy: CertValidationPolicy,
 ) -> miette::Result<()> {
+    let registry = registry.with_alias_resolved(Some(config))?;
+
     #[cfg(feature = "git")]
     async fn git_statuses() -> miette::Result<Vec<String>> {
         use std::process::Stdio;
@@ -335,24 +368,9 @@ pub async fn publish(
         }
     }
 
-    let mut manifest = Manifest::read().await?;
+    let package = prepare_package(version, preserve_mtime, config).await?;
     let credentials = Credentials::load().await?;
-    let store = PackageStore::current().await?;
-    let artifactory = Artifactory::new(registry, &credentials)?;
-
-    if let Some(version) = version {
-        if let Some(ref mut package) = manifest.package {
-            tracing::info!(":: modified version in published manifest to {version}");
-
-            package.version = version;
-        }
-    }
-
-    if let Some(ref pkg) = manifest.package {
-        store.populate(pkg).await?;
-    }
-
-    let package = store.release(&manifest).await?;
+    let artifactory = Artifactory::new(registry.try_into()?, &credentials, policy)?;
 
     if dry_run {
         tracing::warn!(":: aborting upload due to dry run");
@@ -371,38 +389,28 @@ pub enum InstallMode {
     All,
 }
 
-bitflags::bitflags! {
-    /// Flags for generation
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-    pub struct GenerationFlags: u8 {
-        /// Flag for generating buf.yaml files
-        const BUF_YAML = 0b0001;
-    }
+/// Options for optional generation of files
+#[derive(Debug)]
+pub enum GenerationOption {
+    /// Generate a buf.yaml file
+    BufYaml,
 }
 
 /// Installs dependencies
 ///
 /// # Arguments
+/// * `preserve_mtime` - If `true`, local dependencies will keep their modification time
 /// * `mode` - The install mode (dependencies only or all)
 /// * `generation` - Flags for generation of files
 /// * `config` - The configuration
 pub async fn install(
+    preserve_mtime: bool,
     mode: InstallMode,
-    generation: GenerationFlags,
+    generation: &[GenerationOption],
     config: &Config,
+    policy: CertValidationPolicy,
 ) -> miette::Result<()> {
-    let manifest = {
-        let mut manifest = Manifest::read().await?;
-
-        // resolve all alias URLs in the manifest
-        for dependency in manifest.dependencies.iter_mut() {
-            if let DependencyManifest::Remote(ref mut manifest) = &mut dependency.manifest {
-                manifest.registry = config.resolve_registry_uri(&manifest.registry)?;
-            }
-        }
-
-        manifest
-    };
+    let manifest = Manifest::read(config).await?;
     let lockfile = Lockfile::read_or_default().await?;
     let store = PackageStore::current().await?;
     let credentials = Credentials::load().await?;
@@ -418,10 +426,18 @@ pub async fn install(
         }
     }
 
-    let dependency_graph =
-        DependencyGraph::from_manifest(&manifest, &lockfile, &credentials.into(), &cache)
-            .await
-            .wrap_err(miette!("dependency resolution failed"))?;
+    let dependency_graph = DependencyGraphBuilder::new(
+        &manifest,
+        &lockfile,
+        &credentials,
+        &cache,
+        preserve_mtime,
+        config,
+        policy,
+    )
+    .build()
+    .await
+    .wrap_err(miette!("dependency resolution failed"))?;
 
     let mut locked = Vec::new();
 
@@ -478,7 +494,7 @@ pub async fn install(
         Ok(())
     }
 
-    for dependency in manifest.dependencies {
+    for dependency in &manifest.dependencies {
         traverse_and_install(
             &dependency.package,
             &dependency_graph,
@@ -489,54 +505,12 @@ pub async fn install(
         .await?;
     }
 
-    if let GenerationFlags::BUF_YAML = generation {
-        // Check if a buf.yaml file already exists in cwd
-        let mut buf_yaml = if Path::new("buf.yaml").exists() {
-            BufYamlFile::from_file().wrap_err(miette!("failed to read buf.yaml file"))?
-        } else {
-            BufYamlFile::default()
-        };
-
-        // Add vendor modules to the Buf YAML file
-        let mut vendor_modules: Vec<String> = dependency_graph
-            .get_package_names()
-            .iter()
-            .map(|p| p.to_string())
-            .collect();
-        vendor_modules.sort();
-
-        buf_yaml.clear_modules();
-
-        if manifest.package.is_some() {
-            // double-check that the package really contains proto files
-            // under proto/** (but not under proto/vendor/**)
-            let vendor_path = store.proto_vendor_path();
-            let mut has_protos = false;
-            for entry in WalkDir::new(store.proto_path()).into_iter().flatten() {
-                if entry.path().is_file() {
-                    let path = entry.path();
-                    if path.starts_with(&vendor_path) {
-                        continue;
-                    }
-
-                    if path.extension().map_or(false, |ext| ext == "proto") {
-                        has_protos = true;
-                        break;
-                    }
-                }
-            }
-
-            if has_protos {
-                buf_yaml.add_module();
+    for option in generation {
+        match option {
+            GenerationOption::BufYaml => {
+                buf_yaml::generate_buf_yaml_file(&dependency_graph, &manifest, &store)?;
             }
         }
-
-        buf_yaml.set_vendor_modules(vendor_modules);
-
-        // Write the Buf YAML file
-        buf_yaml
-            .to_file()
-            .wrap_err(miette!("failed to write buf.yaml file"))?;
     }
 
     Lockfile::from_iter(locked.into_iter()).write().await
@@ -548,9 +522,9 @@ pub async fn uninstall() -> miette::Result<()> {
 }
 
 /// Lists all protobuf files managed by Buffrs to stdout
-pub async fn list() -> miette::Result<()> {
+pub async fn list(config: &Config) -> miette::Result<()> {
     let store = PackageStore::current().await?;
-    let manifest = Manifest::read().await?;
+    let manifest = Manifest::read(config).await?;
 
     if let Some(ref pkg) = manifest.package {
         store.populate(pkg).await?;
@@ -584,9 +558,10 @@ pub async fn list() -> miette::Result<()> {
         let rel = proto
             .strip_prefix(&cwd)
             .into_diagnostic()
-            .wrap_err(miette!("failed to transform protobuf path"))?;
+            .wrap_err(miette!("failed to transform protobuf path"))?
+            .to_posix_string();
 
-        print!("{} ", rel.display())
+        print!("{} ", rel)
     }
 
     Ok(())
@@ -594,8 +569,8 @@ pub async fn list() -> miette::Result<()> {
 
 /// Parses current package and validates rules.
 #[cfg(feature = "validation")]
-pub async fn lint() -> miette::Result<()> {
-    let manifest = Manifest::read().await?;
+pub async fn lint(config: &Config) -> miette::Result<()> {
+    let manifest = Manifest::read(config).await?;
     let store = PackageStore::current().await?;
 
     let pkg = manifest.package.ok_or(miette!(
@@ -619,8 +594,14 @@ pub async fn lint() -> miette::Result<()> {
 /// # Arguments
 ///  * `registry` - The registry to log in to
 ///  * `token` - An optional token to use, if not provided, the user will be prompted for one
-pub async fn login(registry: &RegistryUri, token: Option<String>) -> miette::Result<()> {
+pub async fn login(
+    registry: &RegistryRef,
+    token: Option<String>,
+    policy: CertValidationPolicy,
+    config: &Config,
+) -> miette::Result<()> {
     let mut credentials = Credentials::load().await?;
+    let registry: RegistryUri = registry.with_alias_resolved(Some(config))?.try_into()?;
 
     let token = match token {
         Some(token) => token,
@@ -643,7 +624,7 @@ pub async fn login(registry: &RegistryUri, token: Option<String>) -> miette::Res
     credentials.registry_tokens.insert(registry.clone(), token);
 
     if env::var(BUFFRS_TESTSUITE_VAR).is_err() {
-        Artifactory::new(registry, &credentials)?
+        Artifactory::new(registry, &credentials, policy)?
             .ping()
             .await
             .wrap_err(miette!("failed to validate token"))?;
@@ -653,9 +634,10 @@ pub async fn login(registry: &RegistryUri, token: Option<String>) -> miette::Res
 }
 
 /// Logs you out from a registry
-pub async fn logout(registry: &RegistryUri) -> miette::Result<()> {
+pub async fn logout(registry: &RegistryRef, config: &Config) -> miette::Result<()> {
+    let registry: RegistryUri = registry.with_alias_resolved(Some(config))?.try_into()?;
     let mut credentials = Credentials::load().await?;
-    credentials.registry_tokens.remove(registry);
+    credentials.registry_tokens.remove(&registry);
     credentials.write().await
 }
 
@@ -668,7 +650,7 @@ pub mod lock {
     pub async fn print_files() -> miette::Result<()> {
         let lock = Lockfile::read().await?;
 
-        let requirements: Vec<FileRequirement> = lock.into();
+        let requirements: Vec<FileRequirement> = lock.try_into()?;
 
         // hint: always ok, as per serde_json doc
         if let Ok(json) = serde_json::to_string_pretty(&requirements) {

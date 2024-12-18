@@ -29,6 +29,8 @@ pub mod config;
 pub mod credentials;
 /// Common error types
 pub mod errors;
+/// Integration with external tools
+pub mod integration;
 /// Lockfile implementation
 pub mod lock;
 /// Manifest format and IO
@@ -42,9 +44,6 @@ pub mod resolver;
 /// Validation for buffrs packages.
 #[cfg(feature = "validation")]
 pub mod validation;
-
-/// buf.yaml generation
-pub mod buf_yaml;
 
 /// Managed directory for `buffrs`
 pub const BUFFRS_HOME: &str = ".buffrs";
